@@ -20,45 +20,6 @@ export default async function handler(req) {
     const path = url.pathname.replace(/^\/api\/?/, '');
     const method = req.method;
 
-    // Ensure database tables exist automatically on first hit
-    await sql`
-      CREATE TABLE IF NOT EXISTS projects (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(120) NOT NULL,
-        slug VARCHAR(120) UNIQUE NOT NULL,
-        environment VARCHAR(50) DEFAULT 'production',
-        region VARCHAR(50) DEFAULT 'aws-us-east-2',
-        status VARCHAR(30) DEFAULT 'healthy',
-        active_connections INT DEFAULT 4,
-        storage_mb NUMERIC(10, 2) DEFAULT 128.5,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
-    `;
-    await sql`
-      CREATE TABLE IF NOT EXISTS query_logs (
-        id SERIAL PRIMARY KEY,
-        project_id INT REFERENCES projects(id) ON DELETE CASCADE,
-        query_text TEXT NOT NULL,
-        duration_ms NUMERIC(10, 2) NOT NULL,
-        rows_affected INT DEFAULT 1,
-        status VARCHAR(20) DEFAULT 'success',
-        executed_by VARCHAR(80) DEFAULT 'neon_agent',
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
-    `;
-    await sql`
-      CREATE TABLE IF NOT EXISTS branches (
-        id SERIAL PRIMARY KEY,
-        project_id INT REFERENCES projects(id) ON DELETE CASCADE,
-        branch_name VARCHAR(100) NOT NULL,
-        parent_branch VARCHAR(100) DEFAULT 'main',
-        compute_state VARCHAR(30) DEFAULT 'idle',
-        is_protected BOOLEAN DEFAULT false,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
-    `;
-
     // 1. Health Ping (/api/health)
     if (path === 'health' || path === 'health/') {
       const startTime = performance.now();
@@ -78,132 +39,198 @@ export default async function handler(req) {
       });
     }
 
-    // 2. Analytics Summary (/api/analytics)
-    if (path === 'analytics' || path === 'analytics/') {
-      const projectsCount = await sql`SELECT count(*) FROM projects;`;
-      const branchesCount = await sql`SELECT count(*) FROM branches;`;
-      const queriesCount = await sql`SELECT count(*), AVG(duration_ms) as avg_latency FROM query_logs;`;
-      const storageSum = await sql`SELECT COALESCE(SUM(storage_mb), 0) as total_storage FROM projects;`;
-      const activeConns = await sql`SELECT COALESCE(SUM(active_connections), 0) as total_conns FROM projects;`;
+    // 2. Dashboard KPIs (/api/dashboard/stats)
+    if (path === 'dashboard/stats' || path === 'dashboard/stats/') {
+      const incomeRes = await sql`SELECT COALESCE(SUM(amount), 0) as total_income FROM transactions WHERE type = 'income';`;
+      const expenseRes = await sql`SELECT COALESCE(SUM(amount), 0) as total_expense FROM transactions WHERE type = 'expense';`;
+      const invoiceStats = await sql`
+        SELECT 
+          COUNT(*) as total_invoices,
+          COALESCE(SUM(CASE WHEN status = 'paid' THEN total_amount ELSE 0 END), 0) as paid_amount,
+          COALESCE(SUM(CASE WHEN status = 'pending' THEN total_amount ELSE 0 END), 0) as pending_amount,
+          COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_count
+        FROM invoices;
+      `;
+      const clientCountRes = await sql`SELECT COUNT(*) as total_clients FROM clients;`;
+
+      const totalIncome = parseFloat(incomeRes[0].total_income);
+      const totalExpense = parseFloat(expenseRes[0].total_expense);
 
       return new Response(JSON.stringify({
-        totalProjects: parseInt(projectsCount[0].count),
-        totalBranches: parseInt(branchesCount[0].count),
-        totalQueriesExecuted: parseInt(queriesCount[0].count),
-        avgQueryLatencyMs: parseFloat(queriesCount[0].avg_latency || 0).toFixed(2),
-        totalStorageMb: parseFloat(storageSum[0].total_storage).toFixed(1),
-        activeConnections: parseInt(activeConns[0].total_conns)
+        totalIncome,
+        totalExpense,
+        netProfit: totalIncome - totalExpense,
+        totalInvoices: parseInt(invoiceStats[0].total_invoices),
+        paidAmount: parseFloat(invoiceStats[0].paid_amount),
+        pendingAmount: parseFloat(invoiceStats[0].pending_amount),
+        pendingCount: parseInt(invoiceStats[0].pending_count),
+        totalClients: parseInt(clientCountRes[0].total_clients)
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // 3. Projects (/api/projects)
-    if (path === 'projects' || path === 'projects/') {
+    // 3. Transactions (/api/transactions)
+    if (path === 'transactions' || path === 'transactions/') {
       if (method === 'GET') {
-        const projects = await sql`
-          SELECT 
-            p.*,
-            COALESCE(json_agg(b.*) FILTER (WHERE b.id IS NOT NULL), '[]') as branches
-          FROM projects p
-          LEFT JOIN branches b ON p.id = b.project_id
-          GROUP BY p.id
-          ORDER BY p.created_at DESC;
-        `;
-        return new Response(JSON.stringify(projects), {
-          headers: { 'Content-Type': 'application/json' }
-        });
+        const type = url.searchParams.get('type');
+        let query;
+        if (type && (type === 'income' || type === 'expense')) {
+          query = await sql`
+            SELECT t.*, c.name as category_name, c.color as category_color, cl.name as client_name
+            FROM transactions t
+            LEFT JOIN categories c ON t.category_id = c.id
+            LEFT JOIN clients cl ON t.client_id = cl.id
+            WHERE t.type = ${type}
+            ORDER BY t.transaction_date DESC, t.id DESC
+            LIMIT 100;
+          `;
+        } else {
+          query = await sql`
+            SELECT t.*, c.name as category_name, c.color as category_color, cl.name as client_name
+            FROM transactions t
+            LEFT JOIN categories c ON t.category_id = c.id
+            LEFT JOIN clients cl ON t.client_id = cl.id
+            ORDER BY t.transaction_date DESC, t.id DESC
+            LIMIT 100;
+          `;
+        }
+        return new Response(JSON.stringify(query), { headers: { 'Content-Type': 'application/json' } });
       }
 
       if (method === 'POST') {
         const body = await req.json();
-        const { name, slug, environment, region } = body;
+        const { title, type, amount, category_id, client_id, payment_method, transaction_date, notes } = body;
         const inserted = await sql`
-          INSERT INTO projects (name, slug, environment, region, status, active_connections, storage_mb)
-          VALUES (${name}, ${slug}, ${environment || 'production'}, ${region || 'aws-us-east-2'}, 'healthy', 1, 10.5)
+          INSERT INTO transactions (title, type, amount, category_id, client_id, payment_method, transaction_date, notes)
+          VALUES (
+            ${title}, ${type}, ${parseFloat(amount)},
+            ${category_id ? parseInt(category_id) : null},
+            ${client_id ? parseInt(client_id) : null},
+            ${payment_method || 'Cash'},
+            ${transaction_date ? new Date(transaction_date) : new Date()},
+            ${notes || null}
+          )
           RETURNING *;
         `;
-        await sql`
-          INSERT INTO branches (project_id, branch_name, parent_branch, compute_state, is_protected)
-          VALUES (${inserted[0].id}, 'main', 'root', 'active', true);
-        `;
-        await sql`
-          INSERT INTO query_logs (project_id, query_text, duration_ms, rows_affected, status, executed_by)
-          VALUES (${inserted[0].id}, 'PROVISION CLUSTER ' || ${slug}, 12.4, 1, 'success', 'admin_console');
-        `;
-        return new Response(JSON.stringify(inserted[0]), {
-          status: 201,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return new Response(JSON.stringify(inserted[0]), { status: 201, headers: { 'Content-Type': 'application/json' } });
       }
     }
 
-    // Delete project (/api/projects/:id)
-    const projectDeleteMatch = path.match(/^projects\/(\d+)\/?$/);
-    if (projectDeleteMatch && method === 'DELETE') {
-      const projId = parseInt(projectDeleteMatch[1]);
-      await sql`DELETE FROM projects WHERE id = ${projId};`;
-      return new Response(JSON.stringify({ message: "Project deleted successfully" }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
+    // Delete transaction (/api/transactions/:id)
+    const txDeleteMatch = path.match(/^transactions\/(\d+)\/?$/);
+    if (txDeleteMatch && method === 'DELETE') {
+      const id = parseInt(txDeleteMatch[1]);
+      await sql`DELETE FROM transactions WHERE id = ${id};`;
+      return new Response(JSON.stringify({ message: "Deleted" }), { headers: { 'Content-Type': 'application/json' } });
     }
 
-    // Create branch (/api/projects/:id/branches)
-    const branchCreateMatch = path.match(/^projects\/(\d+)\/branches\/?$/);
-    if (branchCreateMatch && method === 'POST') {
-      const projId = parseInt(branchCreateMatch[1]);
-      const body = await req.json();
-      const newBranch = await sql`
-        INSERT INTO branches (project_id, branch_name, parent_branch, compute_state, is_protected)
-        VALUES (${projId}, ${body.branch_name}, ${body.parent_branch || 'main'}, 'active', false)
-        RETURNING *;
-      `;
-      await sql`
-        INSERT INTO query_logs (project_id, query_text, duration_ms, rows_affected, status, executed_by)
-        VALUES (${projId}, 'CREATE NEON BRANCH ' || ${body.branch_name}, 8.6, 1, 'success', 'neon_branch_api');
-      `;
-      return new Response(JSON.stringify(newBranch[0]), {
-        status: 201,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // 4. Query Logs (/api/logs)
-    if (path === 'logs' || path === 'logs/') {
-      const logs = await sql`
-        SELECT q.*, p.name as project_name
-        FROM query_logs q
-        LEFT JOIN projects p ON q.project_id = p.id
-        ORDER BY q.created_at DESC
-        LIMIT 25;
-      `;
-      return new Response(JSON.stringify(logs), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // 5. Custom Query Console (/api/query/execute)
-    if (path === 'query/execute' || path === 'query/execute/') {
-      const body = await req.json();
-      const start = performance.now();
-      const result = await sql(body.queryText);
-      const durationMs = parseFloat((performance.now() - start).toFixed(2));
-
-      try {
-        await sql`
-          INSERT INTO query_logs (project_id, query_text, duration_ms, rows_affected, status, executed_by)
-          VALUES (1, ${body.queryText.substring(0, 400)}, ${durationMs}, ${result.length || 0}, 'success', 'sql_playground');
+    // 4. Invoices (/api/invoices)
+    if (path === 'invoices' || path === 'invoices/') {
+      if (method === 'GET') {
+        const invoices = await sql`
+          SELECT 
+            i.*,
+            c.name as client_name,
+            c.email as client_email,
+            c.company as client_company,
+            COALESCE(
+              json_agg(
+                json_build_object(
+                  'id', items.id,
+                  'description', items.description,
+                  'quantity', items.quantity,
+                  'unit_price', items.unit_price,
+                  'total', items.total
+                )
+              ) FILTER (WHERE items.id IS NOT NULL), '[]'
+            ) as items
+          FROM invoices i
+          LEFT JOIN clients c ON i.client_id = c.id
+          LEFT JOIN invoice_items items ON i.id = items.invoice_id
+          GROUP BY i.id, c.id
+          ORDER BY i.created_at DESC;
         `;
-      } catch (_) {}
+        return new Response(JSON.stringify(invoices), { headers: { 'Content-Type': 'application/json' } });
+      }
 
-      return new Response(JSON.stringify({
-        success: true,
-        durationMs,
-        rowCount: result.length,
-        rows: result.slice(0, 100)
-      }), {
-        headers: { 'Content-Type': 'application/json' }
-      });
+      if (method === 'POST') {
+        const body = await req.json();
+        const { client_id, invoice_number, issue_date, due_date, items, tax_rate, discount, notes } = body;
+
+        const subtotal = items.reduce((acc, it) => acc + (parseFloat(it.quantity) * parseFloat(it.unit_price)), 0);
+        const taxRate = parseFloat(tax_rate || 15);
+        const disc = parseFloat(discount || 0);
+        const taxAmt = (subtotal * taxRate) / 100;
+        const total = subtotal + taxAmt - disc;
+        const num = invoice_number || `INV-${Date.now().toString().slice(-6)}`;
+
+        const newInv = await sql`
+          INSERT INTO invoices (invoice_number, client_id, issue_date, due_date, subtotal, tax_rate, tax_amount, discount, total_amount, status, notes)
+          VALUES (${num}, ${parseInt(client_id)}, ${issue_date ? new Date(issue_date) : new Date()}, ${due_date ? new Date(due_date) : new Date(Date.now() + 14 * 86400000)}, ${subtotal}, ${taxRate}, ${taxAmt}, ${disc}, ${total}, 'pending', ${notes || ''})
+          RETURNING *;
+        `;
+
+        for (const it of items) {
+          const qty = parseFloat(it.quantity || 1);
+          const pr = parseFloat(it.unit_price || 0);
+          await sql`INSERT INTO invoice_items (invoice_id, description, quantity, unit_price, total) VALUES (${newInv[0].id}, ${it.description || 'Service'}, ${qty}, ${pr}, ${qty * pr});`;
+        }
+
+        return new Response(JSON.stringify(newInv[0]), { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // Update invoice status (/api/invoices/:id/status)
+    const invStatusMatch = path.match(/^invoices\/(\d+)\/status\/?$/);
+    if (invStatusMatch && method === 'PATCH') {
+      const id = parseInt(invStatusMatch[1]);
+      const { status } = await req.json();
+      const updated = await sql`UPDATE invoices SET status = ${status} WHERE id = ${id} RETURNING *;`;
+      if (status === 'paid' && updated.length > 0) {
+        await sql`
+          INSERT INTO transactions (title, type, amount, client_id, payment_method, notes)
+          VALUES (${'تحصيل فاتورة ' + updated[0].invoice_number}, 'income', ${updated[0].total_amount}, ${updated[0].client_id}, 'Bank Transfer', 'سداد فاتورة');
+        `;
+      }
+      return new Response(JSON.stringify(updated[0]), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Delete invoice (/api/invoices/:id)
+    const invDeleteMatch = path.match(/^invoices\/(\d+)\/?$/);
+    if (invDeleteMatch && method === 'DELETE') {
+      const id = parseInt(invDeleteMatch[1]);
+      await sql`DELETE FROM invoices WHERE id = ${id};`;
+      return new Response(JSON.stringify({ message: "Deleted" }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // 5. Clients (/api/clients)
+    if (path === 'clients' || path === 'clients/') {
+      if (method === 'GET') {
+        const clients = await sql`
+          SELECT c.*, COUNT(DISTINCT i.id) as total_invoices, COALESCE(SUM(i.total_amount), 0) as total_invoiced
+          FROM clients c
+          LEFT JOIN invoices i ON c.id = i.client_id
+          GROUP BY c.id
+          ORDER BY c.name ASC;
+        `;
+        return new Response(JSON.stringify(clients), { headers: { 'Content-Type': 'application/json' } });
+      }
+      if (method === 'POST') {
+        const { name, email, phone, company, balance } = await req.json();
+        const inserted = await sql`
+          INSERT INTO clients (name, email, phone, company, balance)
+          VALUES (${name}, ${email || null}, ${phone || null}, ${company || null}, ${parseFloat(balance || 0)})
+          RETURNING *;
+        `;
+        return new Response(JSON.stringify(inserted[0]), { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // 6. Categories (/api/categories)
+    if (path === 'categories' || path === 'categories/') {
+      const categories = await sql`SELECT * FROM categories ORDER BY name ASC;`;
+      return new Response(JSON.stringify(categories), { headers: { 'Content-Type': 'application/json' } });
     }
 
     return new Response(JSON.stringify({ error: "Endpoint not found", path }), {

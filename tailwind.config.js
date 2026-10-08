@@ -24,7 +24,7 @@ export default {
         }
       },
       fontFamily: {
-        sans: ['IBM Plex Sans', 'Plus Jakarta Sans', 'system-ui', 'sans-serif'],
+        sans: ['Cairo', 'Plus Jakarta Sans', 'IBM Plex Sans', 'system-ui', 'sans-serif'],
         mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
       },
       boxShadow: {

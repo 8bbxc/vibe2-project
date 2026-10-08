@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// Initialize DB schema on boot
+// Initialize DB schema on server boot
 initDatabase().catch(err => {
   console.error("Failed to bootstrap database on server start:", err);
 });
@@ -34,170 +34,351 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// 2. Overview Metrics & Statistics
-app.get('/api/analytics', async (req, res) => {
+// 2. Executive Dashboard KPI Metrics
+app.get('/api/dashboard/stats', async (req, res) => {
   try {
-    const projectsCount = await sql`SELECT count(*) FROM projects;`;
-    const branchesCount = await sql`SELECT count(*) FROM branches;`;
-    const queriesCount = await sql`SELECT count(*), AVG(duration_ms) as avg_latency FROM query_logs;`;
-    const storageSum = await sql`SELECT COALESCE(SUM(storage_mb), 0) as total_storage FROM projects;`;
-    const activeConns = await sql`SELECT COALESCE(SUM(active_connections), 0) as total_conns FROM projects;`;
+    const incomeRes = await sql`
+      SELECT COALESCE(SUM(amount), 0) as total_income 
+      FROM transactions 
+      WHERE type = 'income';
+    `;
+    const expenseRes = await sql`
+      SELECT COALESCE(SUM(amount), 0) as total_expense 
+      FROM transactions 
+      WHERE type = 'expense';
+    `;
+    const invoiceStats = await sql`
+      SELECT 
+        COUNT(*) as total_invoices,
+        COALESCE(SUM(CASE WHEN status = 'paid' THEN total_amount ELSE 0 END), 0) as paid_amount,
+        COALESCE(SUM(CASE WHEN status = 'pending' THEN total_amount ELSE 0 END), 0) as pending_amount,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_count
+      FROM invoices;
+    `;
+    const clientCountRes = await sql`SELECT COUNT(*) as total_clients FROM clients;`;
+
+    const totalIncome = parseFloat(incomeRes[0].total_income);
+    const totalExpense = parseFloat(expenseRes[0].total_expense);
+    const netProfit = totalIncome - totalExpense;
 
     res.json({
-      totalProjects: parseInt(projectsCount[0].count),
-      totalBranches: parseInt(branchesCount[0].count),
-      totalQueriesExecuted: parseInt(queriesCount[0].count),
-      avgQueryLatencyMs: parseFloat(queriesCount[0].avg_latency || 0).toFixed(2),
-      totalStorageMb: parseFloat(storageSum[0].total_storage).toFixed(1),
-      activeConnections: parseInt(activeConns[0].total_conns)
+      totalIncome,
+      totalExpense,
+      netProfit,
+      totalInvoices: parseInt(invoiceStats[0].total_invoices),
+      paidAmount: parseFloat(invoiceStats[0].paid_amount),
+      pendingAmount: parseFloat(invoiceStats[0].pending_amount),
+      pendingCount: parseInt(invoiceStats[0].pending_count),
+      totalClients: parseInt(clientCountRes[0].total_clients)
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// 3. Get All Projects with their Branches
-app.get('/api/projects', async (req, res) => {
+// 3. Transactions - Get All with filters
+app.get('/api/transactions', async (req, res) => {
   try {
-    const projects = await sql`
-      SELECT 
-        p.*,
-        COALESCE(json_agg(b.*) FILTER (WHERE b.id IS NOT NULL), '[]') as branches
-      FROM projects p
-      LEFT JOIN branches b ON p.id = b.project_id
-      GROUP BY p.id
-      ORDER BY p.created_at DESC;
-    `;
-    res.json(projects);
+    const { type, limit } = req.query;
+    const maxRows = parseInt(limit) || 100;
+
+    let query;
+    if (type && (type === 'income' || type === 'expense')) {
+      query = await sql`
+        SELECT 
+          t.*,
+          c.name as category_name,
+          c.color as category_color,
+          cl.name as client_name
+        FROM transactions t
+        LEFT JOIN categories c ON t.category_id = c.id
+        LEFT JOIN clients cl ON t.client_id = cl.id
+        WHERE t.type = ${type}
+        ORDER BY t.transaction_date DESC, t.id DESC
+        LIMIT ${maxRows};
+      `;
+    } else {
+      query = await sql`
+        SELECT 
+          t.*,
+          c.name as category_name,
+          c.color as category_color,
+          cl.name as client_name
+        FROM transactions t
+        LEFT JOIN categories c ON t.category_id = c.id
+        LEFT JOIN clients cl ON t.client_id = cl.id
+        ORDER BY t.transaction_date DESC, t.id DESC
+        LIMIT ${maxRows};
+      `;
+    }
+    res.json(query);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// 4. Create New Project
-app.post('/api/projects', async (req, res) => {
+// 4. Transactions - Create new transaction
+app.post('/api/transactions', async (req, res) => {
   try {
-    const { name, slug, environment, region } = req.body;
+    const { title, type, amount, category_id, client_id, payment_method, transaction_date, notes } = req.body;
 
-    if (!name || !slug) {
-      return res.status(400).json({ error: "Project name and slug are required" });
+    if (!title || !type || !amount) {
+      return res.status(400).json({ error: "Title, type ('income'|'expense') and amount are required" });
     }
 
     const inserted = await sql`
-      INSERT INTO projects (name, slug, environment, region, status, active_connections, storage_mb)
-      VALUES (${name}, ${slug}, ${environment || 'production'}, ${region || 'aws-us-east-2'}, 'healthy', 1, 10.5)
+      INSERT INTO transactions (
+        title, type, amount, category_id, client_id, payment_method, transaction_date, notes
+      )
+      VALUES (
+        ${title},
+        ${type},
+        ${parseFloat(amount)},
+        ${category_id ? parseInt(category_id) : null},
+        ${client_id ? parseInt(client_id) : null},
+        ${payment_method || 'Cash'},
+        ${transaction_date ? new Date(transaction_date) : new Date()},
+        ${notes || null}
+      )
       RETURNING *;
     `;
-
-    // Create root 'main' branch automatically
-    await sql`
-      INSERT INTO branches (project_id, branch_name, parent_branch, compute_state, is_protected)
-      VALUES (${inserted[0].id}, 'main', 'root', 'active', true);
-    `;
-
-    // Log this operation
-    await sql`
-      INSERT INTO query_logs (project_id, query_text, duration_ms, rows_affected, status, executed_by)
-      VALUES (${inserted[0].id}, 'PROVISION CLUSTER ' || ${slug}, 12.4, 1, 'success', 'admin_console');
-    `;
-
     res.status(201).json(inserted[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// 5. Create Instant Branch (Neon Branching primitive)
-app.post('/api/projects/:id/branches', async (req, res) => {
+// 5. Transactions - Delete
+app.delete('/api/transactions/:id', async (req, res) => {
   try {
-    const projectId = parseInt(req.params.id);
-    const { branch_name, parent_branch } = req.body;
+    const id = parseInt(req.params.id);
+    await sql`DELETE FROM transactions WHERE id = ${id};`;
+    res.json({ message: "Transaction deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-    if (!branch_name) {
-      return res.status(400).json({ error: "Branch name is required" });
+// 6. Invoices - Get All
+app.get('/api/invoices', async (req, res) => {
+  try {
+    const invoices = await sql`
+      SELECT 
+        i.*,
+        c.name as client_name,
+        c.email as client_email,
+        c.company as client_company,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id', items.id,
+              'description', items.description,
+              'quantity', items.quantity,
+              'unit_price', items.unit_price,
+              'total', items.total
+            )
+          ) FILTER (WHERE items.id IS NOT NULL), '[]'
+        ) as items
+      FROM invoices i
+      LEFT JOIN clients c ON i.client_id = c.id
+      LEFT JOIN invoice_items items ON i.id = items.invoice_id
+      GROUP BY i.id, c.id
+      ORDER BY i.created_at DESC;
+    `;
+    res.json(invoices);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 7. Invoices - Create Invoice with dynamic items
+app.post('/api/invoices', async (req, res) => {
+  try {
+    const { client_id, invoice_number, issue_date, due_date, items, tax_rate, discount, notes } = req.body;
+
+    if (!client_id || !items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "client_id and at least one item are required" });
     }
 
-    const newBranch = await sql`
-      INSERT INTO branches (project_id, branch_name, parent_branch, compute_state, is_protected)
-      VALUES (${projectId}, ${branch_name}, ${parent_branch || 'main'}, 'active', false)
+    const calculatedSubtotal = items.reduce((acc, it) => acc + (parseFloat(it.quantity) * parseFloat(it.unit_price)), 0);
+    const effectiveTaxRate = parseFloat(tax_rate || 15);
+    const effectiveDiscount = parseFloat(discount || 0);
+    const taxAmount = (calculatedSubtotal * effectiveTaxRate) / 100;
+    const finalTotal = calculatedSubtotal + taxAmount - effectiveDiscount;
+
+    const num = invoice_number || `INV-${Date.now().toString().slice(-6)}`;
+
+    const newInvoice = await sql`
+      INSERT INTO invoices (
+        invoice_number, client_id, issue_date, due_date, subtotal, tax_rate, tax_amount, discount, total_amount, status, notes
+      )
+      VALUES (
+        ${num},
+        ${parseInt(client_id)},
+        ${issue_date ? new Date(issue_date) : new Date()},
+        ${due_date ? new Date(due_date) : new Date(Date.now() + 14 * 86400000)},
+        ${calculatedSubtotal},
+        ${effectiveTaxRate},
+        ${taxAmount},
+        ${effectiveDiscount},
+        ${finalTotal},
+        'pending',
+        ${notes || ''}
+      )
       RETURNING *;
     `;
 
-    // Add query log
-    await sql`
-      INSERT INTO query_logs (project_id, query_text, duration_ms, rows_affected, status, executed_by)
-      VALUES (${projectId}, 'CREATE NEON BRANCH ' || ${branch_name}, 8.6, 1, 'success', 'neon_branch_api');
-    `;
+    const invId = newInvoice[0].id;
 
-    res.status(201).json(newBranch[0]);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 6. Delete Project
-app.delete('/api/projects/:id', async (req, res) => {
-  try {
-    const projectId = parseInt(req.params.id);
-    await sql`DELETE FROM projects WHERE id = ${projectId};`;
-    res.json({ message: "Project deleted successfully" });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 7. Recent Query Logs Feed
-app.get('/api/logs', async (req, res) => {
-  try {
-    const logs = await sql`
-      SELECT q.*, p.name as project_name
-      FROM query_logs q
-      LEFT JOIN projects p ON q.project_id = p.id
-      ORDER BY q.created_at DESC
-      LIMIT 25;
-    `;
-    res.json(logs);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 8. Execute Live Custom SQL Query directly on Neon
-app.post('/api/query/execute', async (req, res) => {
-  try {
-    const { queryText } = req.body;
-    if (!queryText || typeof queryText !== 'string') {
-      return res.status(400).json({ error: "Missing queryText parameter" });
+    for (const it of items) {
+      const itQty = parseFloat(it.quantity || 1);
+      const itPrice = parseFloat(it.unit_price || 0);
+      const itTotal = itQty * itPrice;
+      await sql`
+        INSERT INTO invoice_items (invoice_id, description, quantity, unit_price, total)
+        VALUES (${invId}, ${it.description || 'Service'}, ${itQty}, ${itPrice}, ${itTotal});
+      `;
     }
 
-    // Measure exact serverless execution latency
-    const start = performance.now();
-    // Execute query using template-free direct string
-    const result = await sql(queryText);
-    const durationMs = parseFloat((performance.now() - start).toFixed(2));
+    res.status(201).json(newInvoice[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-    // Save into log
-    try {
+// 8. Invoices - Update status
+app.patch('/api/invoices/:id/status', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { status } = req.body;
+
+    if (!['draft', 'pending', 'paid', 'cancelled'].includes(status)) {
+      return res.status(400).json({ error: "Invalid status value" });
+    }
+
+    const updated = await sql`
+      UPDATE invoices
+      SET status = ${status}
+      WHERE id = ${id}
+      RETURNING *;
+    `;
+
+    // If marked paid, automatically log income transaction
+    if (status === 'paid' && updated.length > 0) {
+      const inv = updated[0];
       await sql`
-        INSERT INTO query_logs (project_id, query_text, duration_ms, rows_affected, status, executed_by)
-        VALUES (1, ${queryText.substring(0, 400)}, ${durationMs}, ${result.length || 0}, 'success', 'sql_playground');
+        INSERT INTO transactions (title, type, amount, client_id, payment_method, notes)
+        VALUES (
+          ${'تحصيل فاتورة ' + inv.invoice_number},
+          'income',
+          ${inv.total_amount},
+          ${inv.client_id},
+          'Bank Transfer',
+          'سداد تلقائي للفاتورة'
+        );
       `;
-    } catch (_) {}
+    }
+
+    res.json(updated[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 9. Invoices - Delete
+app.delete('/api/invoices/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    await sql`DELETE FROM invoices WHERE id = ${id};`;
+    res.json({ message: "Invoice deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 10. Clients - Get All
+app.get('/api/clients', async (req, res) => {
+  try {
+    const clients = await sql`
+      SELECT 
+        c.*,
+        COUNT(DISTINCT i.id) as total_invoices,
+        COALESCE(SUM(i.total_amount), 0) as total_invoiced
+      FROM clients c
+      LEFT JOIN invoices i ON c.id = i.client_id
+      GROUP BY c.id
+      ORDER BY c.name ASC;
+    `;
+    res.json(clients);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 11. Clients - Create new client
+app.post('/api/clients', async (req, res) => {
+  try {
+    const { name, email, phone, company, balance } = req.body;
+    if (!name) {
+      return res.status(400).json({ error: "Client name is required" });
+    }
+
+    const inserted = await sql`
+      INSERT INTO clients (name, email, phone, company, balance)
+      VALUES (${name}, ${email || null}, ${phone || null}, ${company || null}, ${parseFloat(balance || 0)})
+      RETURNING *;
+    `;
+    res.status(201).json(inserted[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 12. Categories - Get All
+app.get('/api/categories', async (req, res) => {
+  try {
+    const categories = await sql`SELECT * FROM categories ORDER BY name ASC;`;
+    res.json(categories);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 13. Financial Reports & Breakdown Analytics
+app.get('/api/reports/summary', async (req, res) => {
+  try {
+    const categoryBreakdown = await sql`
+      SELECT 
+        c.name as category,
+        c.type,
+        c.color,
+        COALESCE(SUM(t.amount), 0) as total
+      FROM categories c
+      LEFT JOIN transactions t ON c.id = t.category_id
+      GROUP BY c.id
+      ORDER BY total DESC;
+    `;
+
+    const monthlyBreakdown = await sql`
+      SELECT 
+        TO_CHAR(transaction_date, 'YYYY-MM') as month,
+        SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END) as income,
+        SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END) as expense
+      FROM transactions
+      GROUP BY TO_CHAR(transaction_date, 'YYYY-MM')
+      ORDER BY month ASC
+      LIMIT 6;
+    `;
 
     res.json({
-      success: true,
-      durationMs,
-      rowCount: result.length,
-      rows: result.slice(0, 100) // cap to 100 preview rows
+      categoryBreakdown,
+      monthlyBreakdown
     });
   } catch (error) {
-    res.status(400).json({
-      success: false,
-      error: error.message
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`NeonPulse OS Backend API listening on port ${PORT}`);
+  console.log(`Smart Accounting API Server is running on port ${PORT}`);
 });
